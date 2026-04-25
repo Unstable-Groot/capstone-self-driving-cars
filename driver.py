@@ -1,20 +1,23 @@
 #!/usr/bin/env python
+import os
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Int64
-from std_msgs.msg import Int32,Int32MultiArray
+from std_msgs.msg import Int32MultiArray
+from geometry_msgs.msg import PoseStamped
 import struct
 import can
 import threading
-import time
 
-fps = 40
+POSE_TOPIC = os.environ.get("POSE_TOPIC", "/zed/zed_node/pose")
+
+FPS = 40
 throttle = 0
 steer = 0
 stop_signal = 0
-current_size = 0
+
 stop_time = 3
-parked_frames = fps * 2
+parked_frames = FPS
 parked_countdown = 0
 
 auto_throttle = 0
@@ -22,14 +25,16 @@ auto_steer = 0
  
 toggle = 0
 
+pose_dict = None
+prev_pose_dict = None
+
 ## ------------
 ## YOUR CODE
 ## ------------
 def stop_callback(data):
-    global stop_signal, current_size
-    print("################################",data.data)
+    global stop_signal
+    # print("################################",data.data)
     stop_signal = data.data[0]
-    current_size = data.data[1]
 
 def steering_callback(data):
     global steer
@@ -56,6 +61,53 @@ def toggle_callback(data):
 
     toggle = data.data
 
+def pos_callback(msg):
+    global pose_dict, prev_pose_dict
+
+    prev_pose_dict = pose_dict
+
+    p = msg.pose.position
+    o = msg.pose.orientation
+    stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+    pose_dict = {
+        "type": "pose",
+        "ts": stamp,
+        "frame": msg.header.frame_id,
+        "position": {"x": p.x, "y": p.y, "z": p.z},
+        "orientation": {"x": o.x, "y": o.y, "z": o.z, "w": o.w},
+    }
+
+STILL_THRESHOLD = 0.01
+def is_car_still_or_going_backwards() -> bool:
+    if pose_dict is None or prev_pose_dict is None:
+        return True # No data yet
+
+    dt = pose_dict["ts"] - prev_pose_dict["ts"]
+    if dt <= 0:
+        return True  # Bad timestamp delta, assume still
+
+    # Compute displacement between the two poses
+    dx = pose_dict["position"]["x"] - prev_pose_dict["position"]["x"]
+    dy = pose_dict["position"]["y"] - prev_pose_dict["position"]["y"]
+
+    # Use orientation to project displacement onto the car's forward axis,
+    # so lateral drift or noise doesn't count as "moving forward"
+    qx = pose_dict["orientation"]["x"]
+    qy = pose_dict["orientation"]["y"]
+    qz = pose_dict["orientation"]["z"]
+    qw = pose_dict["orientation"]["w"]
+
+    # Rotate unit forward vector [1, 0, 0] by quaternion to get car's heading
+    forward_x = 1 - 2 * (qy**2 + qz**2)
+    forward_y = 2 * (qx*qy + qw*qz)
+
+    # Project displacement onto forward axis (dot product)
+    forward_speed = (dx * forward_x + dy * forward_y) / dt
+
+    print(f"forward_speed: {forward_speed:.4f} m/s")
+
+    return forward_speed < STILL_THRESHOLD
+
 
 def main(args=None):
     global throttle, parked_countdown, steer, toggle
@@ -79,15 +131,16 @@ def main(args=None):
     stop_sub = node.create_subscription(Int32MultiArray, "/detections/stop", stop_callback, 1)
     toggle_sub = node.create_subscription(Int64, '/manual_a_toggle', toggle_callback, 1)
 
+    pos_sub = node.create_subscription(PoseStamped, POSE_TOPIC, pos_callback, 1)
 
 
     thread = threading.Thread(target=rclpy. spin, args=(node, ), daemon=True)
     thread.start()
 
     stopping = False
-    previous_size = 0
+    temp_ignore = 0
  
-    rate = node.create_rate(fps, node.get_clock())
+    rate = node.create_rate(FPS, node.get_clock())
     while rclpy.ok():
 
         try:
@@ -105,44 +158,33 @@ def main(args=None):
             
             else:
                 # --- AUTO MODE ---
-                # Default to lane following
                 current_throttle = throttle
                 current_steer = auto_steer
 
-                # 1. Check for Stop Sign to trigger the sequence
-                if stop_signal == 1 and current_throttle > 0 and not stopping and parked_countdown == 0:
+                # Check for stop sign
+                if stop_signal == 1 and current_throttle > 0 and not stopping and parked_countdown == 0 and temp_ignore == 0:
                     stopping = True
-                    print("Stop signal detected! Starting parking sequence...")
+                    temp_ignore = 1
 
-                # 2. Execution of the sequence (The Overrides)
+                # We only want to stop the car again after we pass the current stop sign
+                if stop_signal == 0 and not stopping and parked_countdown == 0:
+                    temp_ignore = 0
+
                 if parked_countdown > 0:
-                    # Stage 3: Currently "Parked" (Hard Brake & Turn)
                     current_throttle = 0
                     current_steer = 0
                     parked_countdown -= 1
-                    print(f"Parked. Countdown: {parked_countdown}")
 
                 elif stopping:
-                    # Stage 2: Approaching/Braking
-                    if current_size > previous_size:
+                    if not is_car_still_or_going_backwards():
                         # Still moving toward the sign: Apply Reverse/Brake
                         current_throttle = -70
                         current_steer = auto_steer # Keep steering while braking
-                        print(f"Braking... Size: {current_size}")
                     else:
-                        # Size stopped increasing: We have reached the stop point
                         current_throttle = 0
                         stopping = False
                         parked_countdown = parked_frames
-                        print("Stop reached. Entering parked state.")
 
-            # Update size for the next iteration
-            previous_size = current_size
-
-
-            print("throttle:", current_throttle, "steer:", current_steer)
-            # 3. Pack and Send CAN Message
-            # Ensure values are integers for struct.pack
             can_data = struct.pack('>hhI', int(current_throttle), int(current_steer), 0)
             msg = can.Message(arbitration_id=0x1, data=can_data, is_extended_id=False)
             bus.send(msg)

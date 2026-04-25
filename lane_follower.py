@@ -9,14 +9,15 @@ import threading
 import time
 import math
 import numpy as np
+from cv_bridge import CvBridge
 
 #Default: stereo image (from both L and R lenses)
 IMAGE_TOPIC = '/zed/zed_node/right/color/rect/image'
 STEER_TOPIC = "/auto_steering"
 
 steering = 0
-HEIGHT = int(540)
-WIDTH = int(960)
+HEIGHT = int(540/2)
+WIDTH = int(960/2)
 
 IMG_HEIGHT = HEIGHT
 IMG_WIDTH = int(WIDTH)
@@ -27,15 +28,25 @@ HALF_WIDTH = int(IMG_WIDTH / 2)
 MASK = np.zeros((IMG_HEIGHT, IMG_WIDTH), dtype=np.uint8)
 mask_edge = IMG_HEIGHT - int(IMG_HEIGHT/3)
 mask_tip_x = int(IMG_WIDTH/2)
-mask_tip_y = int(IMG_HEIGHT/2) + int(IMG_HEIGHT/6) 
+mask_tip_y = int(IMG_HEIGHT/2) + int(IMG_HEIGHT/12)
 
-PREVIOUS_DECISION = 0
+PREVIOUS_DECISIONS = [0, 0]
+OLDEST_DECISION = 0
 
-AVERAGE_LINE_WIDTH = 300
+lower_yellow = np.array([25, 100, 150])
+upper_yellow = np.array([40, 255, 255])
 
+lower_pale_yellow = np.array([20, 60, 200]) 
+upper_pale_yellow = np.array([45, 100, 255])
+
+# Constants for recovery
+LANE_WIDTH_PX = 500 # Adjust based on your camera calibration
 
 vertices = [ np.array([ [0,IMG_HEIGHT], [0,mask_edge], [mask_tip_x,mask_tip_y], [IMG_WIDTH,mask_edge], [IMG_WIDTH,IMG_HEIGHT] ], dtype=np.int32) ]
 cv2.fillPoly(MASK, vertices, (255,255,255))
+
+camera = None
+publish_image = None
 
 br = CvBridge()
 image = None
@@ -73,87 +84,88 @@ def process_image(img):
     global steering
     global PREVIOUS_DECISIONS
     global OLDEST_DECISION
+    global publish_image
     ######
     # YOUR CODE: Lane Detection
     ######
 
     #Example: If you want to use a smaller image
-    # img = cv2.resize(img, (WIDTH, HEIGHT))
+    img = cv2.resize(img, (WIDTH, HEIGHT))
     # cv2.imshow('Small', img)
 
 
     # Yellow pass filter
-    lower_yellow = np.array([25, 70, 150])
-    upper_yellow = np.array([40, 255, 255])
     
-    blurred_image = cv2.GaussianBlur(img, (7, 7), 0)
-    hsv = cv2.cvtColor(blurred_image, cv2.COLOR_BGR2HSV)
+    
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    
+    yellow_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
+    pale_mask = cv2.inRange(hsv, lower_pale_yellow, upper_pale_yellow)
 
-    mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
-    result = cv2.bitwise_and(img, img, mask=mask)
+    combined_mask = cv2.bitwise_or(yellow_mask, pale_mask)
 
-    gray_img = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+    masked = cv2.bitwise_and(combined_mask, MASK)
 
-    masked = cv2.bitwise_and(gray_img, MASK)
+    
 
-
-
-    pixel_y, pixel_x = np.where(masked > 0)
-
-    if len(pixel_x) < 10: # Not enough pixels to make a decision
-        return 0
     
     # 1. Find continuous blobs (contours) of color
     contours, _ = cv2.findContours(masked, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    left_x, left_y = [], []
-    right_x, right_y = [], []
+    candidate_lines = []
 
     for contour in contours:
-        # 2. Filter out tiny speckles/noise
-        if cv2.contourArea(contour) < 150:  # Tune this threshold as needed
+        if cv2.contourArea(contour) < 50:
             continue
 
-        # 3. Find where the lane starts at the bottom of the screen
-        # In OpenCV, a higher Y coordinate means lower on the screen
-        bottom_most_point = contour[contour[:, :, 1].argmax()][0]
-        start_x = bottom_most_point[0]
-
-        # 4. Extract all exact pixels belonging to this specific contour
         contour_mask = np.zeros_like(masked)
         cv2.drawContours(contour_mask, [contour], -1, 255, thickness=cv2.FILLED)
         c_y, c_x = np.where(contour_mask > 0)
 
-        # 5. Assign the ENTIRE contour to left or right based on its starting position
-        if start_x < HALF_WIDTH:
-            left_x.extend(c_x)
-            left_y.extend(c_y)
-        else:
-            right_x.extend(c_x)
-            right_y.extend(c_y)
+        if len(c_x) < 20:
+            continue
 
-   # 3. Fit Lines (fitting x as a function of y: x = my + b)
+        # Only keep blobs that touch an edge
+        touches_bottom = np.any(c_y >= IMG_HEIGHT - 5)
+        touches_left   = np.any(c_x <= 5)
+        touches_right  = np.any(c_x >= IMG_WIDTH - 5)
+        touches_top    = np.any(c_y <= 5)
+
+        if not (touches_bottom or touches_left or touches_right or touches_top):
+            continue
+
+        contour_fit = np.polyfit(c_y, c_x, 1)
+        x_at_bottom = int(contour_fit[0] * IMG_HEIGHT + contour_fit[1])
+
+        candidate_lines.append({
+            'fit': contour_fit,
+            'x_at_bottom': x_at_bottom,
+        })
+
+    # Sort left to right, then just assign by position
+    candidate_lines.sort(key=lambda l: l['x_at_bottom'])
+
     left_fit = None
     right_fit = None
-    
-    if len(left_x) > 50:
-        temp_fit = np.polyfit(left_y, left_x, 1)
-        # Left line slope in this coordinate system (x=f(y)) should be negative
-        if -1.5 < temp_fit[0] < 0.1: # Threshold to ensure it's not tilting the wrong way
-            left_fit = temp_fit
 
-    if len(right_x) > 50:
-        temp_fit = np.polyfit(right_y, right_x, 1)
-        # Right line slope in this coordinate system should be positive
-        if 1.5 > temp_fit[0] > -0.1: 
-            right_fit = temp_fit
+    if len(candidate_lines) == 2:
+        left_fit  = candidate_lines[0]['fit']
+        right_fit = candidate_lines[1]['fit']
+    elif len(candidate_lines) == 1:
+        line = candidate_lines[0]
+        if line['x_at_bottom'] <= HALF_WIDTH:
+            left_fit = line['fit']
+        else:
+            right_fit = line['fit']
+    # else: 0 lines, both remain None -> hits Scenario D
 
     # 4. Calculate Midline with improved fallback
     y1 = IMG_HEIGHT
     y2 = mask_tip_y
 
-    # Constants for recovery
-    LANE_WIDTH_PX = 1000 # Adjust based on your camera calibration
+    print(left_fit, right_fit)
+
+
 
     if left_fit is not None and right_fit is not None:
         # Scenario A: Both lines detected
@@ -171,7 +183,7 @@ def process_image(img):
         l_top = get_x(left_fit, y2)
         
         lane_center_bottom = l_bottom + (LANE_WIDTH_PX // 2)
-        lane_center_lookahead = l_top + (LANE_WIDTH_PX // 2)
+        lane_center_lookahead = l_top + (LANE_WIDTH_PX // 6)
         
         # Virtual right line for drawing
         right_fit = [left_fit[0], left_fit[1] + LANE_WIDTH_PX]
@@ -182,7 +194,7 @@ def process_image(img):
         r_top = get_x(right_fit, y2)
         
         lane_center_bottom = r_bottom - (LANE_WIDTH_PX // 2)
-        lane_center_lookahead = r_top - (LANE_WIDTH_PX // 2)
+        lane_center_lookahead = r_top - (LANE_WIDTH_PX // 6)
         
         # Virtual left line for drawing
         left_fit = [right_fit[0], right_fit[1] - LANE_WIDTH_PX]
@@ -192,66 +204,81 @@ def process_image(img):
         steering = 0.0
         return 0
 
-    # 5. Steering Logic (CTE)
-    CAMERA_OFFSET_PX = 30  # tune: positive = camera is right of center
-    car_center = HALF_WIDTH - CAMERA_OFFSET_PX  # true vehicle centerline
 
-    cte_bottom = car_center - lane_center_bottom
-    cte_lookahead = car_center - lane_center_lookahead
+    car_camera_offset = -15
 
+    lookahead_weight = 1
+    cte = HALF_WIDTH - lane_center_lookahead * lookahead_weight - lane_center_bottom * (1 - lookahead_weight) + car_camera_offset
+    print("cte: ",cte)
+    #set steering amount
+    max_steer_threshold = HALF_WIDTH 
+    steering_scaler = 60
+    max_steer_amount = 60
+    if(math.fabs(cte) > 0):
+        steering = math.copysign((cte / max_steer_threshold * steering_scaler), cte)
+        
 
-    # Anticipate the turn, but stay grounded in the current lane
-    cte = (cte_lookahead * 0.50) + (cte_bottom * 0.50) 
+        if (math.fabs(steering) > max_steer_amount):
+            steering = math.copysign(max_steer_amount, cte)
 
-    max_steer_threshold = int(HALF_WIDTH * .7)
-    max_steer_amount = 80.0
-    
-    LOOKAHEAD_PX = mask_tip_y
+        steering *= -1
 
-    angle_rad = math.atan2(cte, LOOKAHEAD_PX)
-    angle_deg = math.degrees(angle_rad)
-
-    steering = np.clip(angle_deg, -max_steer_amount, max_steer_amount)
+    PREVIOUS_DECISIONS[OLDEST_DECISION] = steering
+    OLDEST_DECISION = (OLDEST_DECISION + 1) % len(PREVIOUS_DECISIONS)
     
 
 # ros2 launch zed_wrapper zed_camera.launch.py camera_model:=zed2i
 # 10.138.194.207
 
-    # # 6. Fixed Line Drawing
-    # line_img = np.zeros_like(img)
+#     # 6. Fixed Line Drawing
+#     line_img = np.zeros_like(img)
 
-    # # Draw detected lanes
-    # if left_fit is not None:
-    #     cv2.line(line_img, (get_x(left_fit, y1), y1), (get_x(left_fit, y2), y2), (0, 255, 0), 5)
-    # if right_fit is not None:
-    #     cv2.line(line_img, (get_x(right_fit, y1), y1), (get_x(right_fit, y2), y2), (0, 0, 255), 5)
+#     # Draw detected lanes
+#     if left_fit is not None:
+#         cv2.line(line_img, (get_x(left_fit, y1), y1), (get_x(left_fit, y2), y2), (0, 255, 0), 5)
+#     if right_fit is not None:
+#         cv2.line(line_img, (get_x(right_fit, y1), y1), (get_x(right_fit, y2), y2), (0, 0, 255), 5)
 
-    # # Draw steering midline (Pink) and vehicle center (White)
-    # cv2.line(line_img, (int(lane_center_bottom), y1), (int(lane_center_lookahead), y2), (255, 0, 255), 3)
-    # cv2.line(line_img, (HALF_WIDTH, y1), (HALF_WIDTH, y2), (255, 255, 255), 1)
+#     # Draw steering midline (Pink) and vehicle center (White)
+#     cv2.line(line_img, (int(lane_center_bottom), y1), (int(lane_center_lookahead), y2), (255, 0, 255), 3)
+#     cv2.line(line_img, (HALF_WIDTH, y1), (HALF_WIDTH, y2), (255, 255, 255), 1)
 
-    # overlay = cv2.addWeighted(img, 0.8, line_img, 1.0, 0.0)
-    # cv2.imshow('Lane Tracking', overlay)
-    # cv2.imshow('Yellow Only', masked)
+#     overlay = cv2.addWeighted(img, 0.8, line_img, 1.0, 0.0)
 
+#    # Create an empty 3-channel image for the blue mask
+#     blue_mask_visual = np.zeros_like(img)
+#     # Set the Blue channel (index 0 in BGR) to the values of 'masked'
+#     blue_mask_visual[:, :, 0] = masked 
 
-    # cv2.waitKey(1)
+#     # Combine the blue mask with the previous overlay
+#     overlay2 = cv2.addWeighted(overlay, 0.8, blue_mask_visual, 1.0, 0.0)
+
+#     #cv2.imshow('Lane Tracking', overlay)
+#     #cv2.imshow('Yellow Only', masked)
+    
+
+#     publish_image = overlay2
+
+   # cv2.waitKey(1)
 
     return 0
 
 def main():
-    global PREVIOUS_DECISION
+    global camera, publish_image
 
     rclpy.init()
     node = rclpy.create_node('lane_follower')
     node.create_subscription(Image, IMAGE_TOPIC, camera_callback, 10)
     
+    # bridge = CvBridge()
+
     thread = threading.Thread(target=rclpy.spin, args=(node, ), daemon=True)
     thread.start()
 
     auto_steering = node.create_publisher(Int64, "/auto_steering",1)
+    # camera = node.create_publisher(Image, "/custom_camera",1)
 
-    FREQ = 10
+    FREQ = 40
     rate = node.create_rate(FREQ, node.get_clock())
     
     while rclpy.ok() and image is None:
@@ -261,18 +288,18 @@ def main():
     while rclpy.ok():
         # Process one image. The return value will be use for `something` later.
         ret = process_image(image)
-        
-        constant = .8
-        exponential = steering * constant + (1 - constant) * PREVIOUS_DECISION
-        PREVIOUS_DECISION = exponential
-
-        # Helps keep the car straight. The car naturally leans left.
-        exponential += 6
-        print("Steering: ", -exponential)
+        average_steering = sum(PREVIOUS_DECISIONS) / len(PREVIOUS_DECISIONS)
+        print("Steering: ", average_steering)
         wrapped_steering = Int64()
-        wrapped_steering.data = int (-exponential)
+        wrapped_steering.data = int (average_steering)
 
         auto_steering.publish(wrapped_steering)
+
+        # if publish_image is not None:
+        #     print("publishing")
+        #     camera.publish(bridge.cv2_to_imgmsg(publish_image, 'bgr8'))
+        # else:
+        #     print("why not")
         
         rate.sleep()
 
