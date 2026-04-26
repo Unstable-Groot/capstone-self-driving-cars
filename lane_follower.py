@@ -1,171 +1,156 @@
 #!/usr/bin/env python
+
+import math
+import threading
+
+import cv2
+import numpy as np
 import rclpy
+from cv_bridge import CvBridge
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import Int64
-import cv2
-from cv_bridge import CvBridge
-import threading
-import time
-import math
-import numpy as np
-from cv_bridge import CvBridge
 
-#Default: stereo image (from both L and R lenses)
-IMAGE_TOPIC = '/zed/zed_node/right/color/rect/image'
+# Constants
+IMAGE_TOPIC = "/zed/zed_node/right/color/rect/image"
 STEER_TOPIC = "/auto_steering"
 
-steering = 0
-HEIGHT = int(540/2)
-WIDTH = int(960/2)
+FREQ = 40
 
+HEIGHT     = int(540 / 2)
+WIDTH      = int(960 / 2)
 IMG_HEIGHT = HEIGHT
-IMG_WIDTH = int(WIDTH)
+IMG_WIDTH  = WIDTH
+HALF_WIDTH = IMG_WIDTH // 2
 
-HALF_WIDTH = int(IMG_WIDTH / 2)
+LANE_WIDTH_PX = 500
 
+CAR_CAMERA_OFFSET  = -15
+LOOKAHEAD_WEIGHT   = 1
+MAX_STEER_SCALER   = 60
+MAX_STEER_AMOUNT   = 60
 
-MASK = np.zeros((IMG_HEIGHT, IMG_WIDTH), dtype=np.uint8)
-mask_edge = IMG_HEIGHT - int(IMG_HEIGHT/3)
-mask_tip_x = int(IMG_WIDTH/2)
-mask_tip_y = int(IMG_HEIGHT/2) + int(IMG_HEIGHT/12)
+CONTOUR_AREA_MIN   = 50
+CONTOUR_POINTS_MIN = 20
+EDGE_MARGIN        = 5
 
+# Yellow lane colour ranges (HSV)
+LOWER_YELLOW      = np.array([25, 100, 150])
+UPPER_YELLOW      = np.array([40, 255, 255])
+LOWER_PALE_YELLOW = np.array([20,  60, 200])
+UPPER_PALE_YELLOW = np.array([45, 100, 255])
+
+# ROI mask
+MASK         = np.zeros((IMG_HEIGHT, IMG_WIDTH), dtype=np.uint8)
+MASK_EDGE    = IMG_HEIGHT - IMG_HEIGHT // 3
+MASK_TIP_X   = IMG_WIDTH  // 2
+MASK_TIP_Y   = IMG_HEIGHT // 2 + IMG_HEIGHT // 12
+
+vertices = [np.array([
+    [0,         IMG_HEIGHT],
+    [0,         MASK_EDGE ],
+    [MASK_TIP_X, MASK_TIP_Y],
+    [IMG_WIDTH,  MASK_EDGE ],
+    [IMG_WIDTH,  IMG_HEIGHT],
+], dtype=np.int32)]
+cv2.fillPoly(MASK, vertices, (255, 255, 255))
+
+# State
+br                 = CvBridge()
+image              = None
+steering           = 0
 PREVIOUS_DECISIONS = [0, 0]
-OLDEST_DECISION = 0
+OLDEST_DECISION    = 0
 
-lower_yellow = np.array([25, 100, 150])
-upper_yellow = np.array([40, 255, 255])
-
-lower_pale_yellow = np.array([20, 60, 200]) 
-upper_pale_yellow = np.array([45, 100, 255])
-
-# Constants for recovery
-LANE_WIDTH_PX = 500 # Adjust based on your camera calibration
-
-vertices = [ np.array([ [0,IMG_HEIGHT], [0,mask_edge], [mask_tip_x,mask_tip_y], [IMG_WIDTH,mask_edge], [IMG_WIDTH,IMG_HEIGHT] ], dtype=np.int32) ]
-cv2.fillPoly(MASK, vertices, (255,255,255))
-
-camera = None
-publish_image = None
-
-br = CvBridge()
-image = None
+# Callbacks
 def camera_callback(data):
     global image
     image = br.imgmsg_to_cv2(data)
-    image = image[:,:,:3]
+    image = image[:, :, :3]
 
-def repack(line_list):
-    x_list = []
-    y_list = []
-    for line in line_list:
-        for x1, y1, x2, y2 in line:
-            x_list.append(x1)
-            x_list.append(x2)
-            y_list.append(y1)
-            y_list.append(y2)
-    
-    return (x_list, y_list)
 
-def drawline(img, color, line):
-    line_thickness=3
-    dot_size = 3
-    for x1, y1, x2, y2 in line:
-            cv2.line(img, (x1, y1), (x2, y2), color, line_thickness)
-            cv2.circle(img, (x1, y1), dot_size, color, -1)
-            cv2.circle(img, (x2, y2), dot_size, color, -1)
-
-def get_x(fit, y):
-    # fit[0] is the slope, fit[1] is the intercept
-    # returns the horizontal pixel coordinate (x) for a given vertical pixel (y)
+def get_x(fit, y) -> int:
+    """Return the x pixel coordinate on a fitted line at height y."""
     return int(fit[0] * y + fit[1])
 
+
+def drawline(img, color, line):
+    LINE_THICKNESS = 3
+    DOT_SIZE       = 3
+    for x1, y1, x2, y2 in line:
+        cv2.line(img, (x1, y1), (x2, y2), color, LINE_THICKNESS)
+        cv2.circle(img, (x1, y1), DOT_SIZE, color, -1)
+        cv2.circle(img, (x2, y2), DOT_SIZE, color, -1)
+
+
+def repack(line_list):
+    x_list, y_list = [], []
+    for line in line_list:
+        for x1, y1, x2, y2 in line:
+            x_list += [x1, x2]
+            y_list += [y1, y2]
+    return x_list, y_list
+
+
 def process_image(img):
-    global steering
-    global PREVIOUS_DECISIONS
-    global OLDEST_DECISION
-    global publish_image
-    ######
-    # YOUR CODE: Lane Detection
-    ######
+    global steering, PREVIOUS_DECISIONS, OLDEST_DECISION
 
-    #Example: If you want to use a smaller image
     img = cv2.resize(img, (WIDTH, HEIGHT))
-    # cv2.imshow('Small', img)
+
+    hsv          = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    yellow_mask  = cv2.inRange(hsv, LOWER_YELLOW,      UPPER_YELLOW)
+    pale_mask    = cv2.inRange(hsv, LOWER_PALE_YELLOW, UPPER_PALE_YELLOW)
+    combined     = cv2.bitwise_or(yellow_mask, pale_mask)
+    masked       = cv2.bitwise_and(combined, MASK)
 
 
-    # Yellow pass filter
-    
-    
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    
-    yellow_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
-    pale_mask = cv2.inRange(hsv, lower_pale_yellow, upper_pale_yellow)
-
-    combined_mask = cv2.bitwise_or(yellow_mask, pale_mask)
-
-    masked = cv2.bitwise_and(combined_mask, MASK)
-
-    
-
-    
-    # 1. Find continuous blobs (contours) of color
     contours, _ = cv2.findContours(masked, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     candidate_lines = []
-
     for contour in contours:
-        if cv2.contourArea(contour) < 50:
+        if cv2.contourArea(contour) < CONTOUR_AREA_MIN:
             continue
 
         contour_mask = np.zeros_like(masked)
         cv2.drawContours(contour_mask, [contour], -1, 255, thickness=cv2.FILLED)
         c_y, c_x = np.where(contour_mask > 0)
 
-        if len(c_x) < 20:
+        if len(c_x) < CONTOUR_POINTS_MIN:
             continue
 
-        # Only keep blobs that touch an edge
-        touches_bottom = np.any(c_y >= IMG_HEIGHT - 5)
-        touches_left   = np.any(c_x <= 5)
-        touches_right  = np.any(c_x >= IMG_WIDTH - 5)
-        touches_top    = np.any(c_y <= 5)
-
+        # Only keep blobs that touch an image edge
+        touches_bottom = np.any(c_y >= IMG_HEIGHT - EDGE_MARGIN)
+        touches_left   = np.any(c_x <= EDGE_MARGIN)
+        touches_right  = np.any(c_x >= IMG_WIDTH  - EDGE_MARGIN)
+        touches_top    = np.any(c_y <= EDGE_MARGIN)
         if not (touches_bottom or touches_left or touches_right or touches_top):
             continue
 
-        contour_fit = np.polyfit(c_y, c_x, 1)
-        x_at_bottom = int(contour_fit[0] * IMG_HEIGHT + contour_fit[1])
+        fit          = np.polyfit(c_y, c_x, 1)
+        x_at_bottom  = int(fit[0] * IMG_HEIGHT + fit[1])
+        candidate_lines.append({"fit": fit, "x_at_bottom": x_at_bottom})
 
-        candidate_lines.append({
-            'fit': contour_fit,
-            'x_at_bottom': x_at_bottom,
-        })
+    # Sort left to right and assign lanes
+    candidate_lines.sort(key=lambda l: l["x_at_bottom"])
 
-    # Sort left to right, then just assign by position
-    candidate_lines.sort(key=lambda l: l['x_at_bottom'])
-
-    left_fit = None
+    left_fit  = None
     right_fit = None
 
     if len(candidate_lines) == 2:
-        left_fit  = candidate_lines[0]['fit']
-        right_fit = candidate_lines[1]['fit']
+        left_fit  = candidate_lines[0]["fit"]
+        right_fit = candidate_lines[1]["fit"]
     elif len(candidate_lines) == 1:
         line = candidate_lines[0]
-        if line['x_at_bottom'] <= HALF_WIDTH:
-            left_fit = line['fit']
+        if line["x_at_bottom"] <= HALF_WIDTH:
+            left_fit  = line["fit"]
         else:
-            right_fit = line['fit']
-    # else: 0 lines, both remain None -> hits Scenario D
+            right_fit = line["fit"]
 
-    # 4. Calculate Midline with improved fallback
-    y1 = IMG_HEIGHT
-    y2 = mask_tip_y
+    # lane center calculations
+    y_bottom = IMG_HEIGHT
+    y_top    = MASK_TIP_Y
 
     print(left_fit, right_fit)
-
-
 
     if left_fit is not None and right_fit is not None:
         # Scenario A: Both lines detected
@@ -205,22 +190,18 @@ def process_image(img):
         return 0
 
 
-    car_camera_offset = -15
+    cte = (
+        HALF_WIDTH
+        - lane_center_lookahead * LOOKAHEAD_WEIGHT
+        - lane_center_bottom    * (1 - LOOKAHEAD_WEIGHT)
+        + CAR_CAMERA_OFFSET
+    )
+    print("cte:", cte)
 
-    lookahead_weight = 1
-    cte = HALF_WIDTH - lane_center_lookahead * lookahead_weight - lane_center_bottom * (1 - lookahead_weight) + car_camera_offset
-    print("cte: ",cte)
-    #set steering amount
-    max_steer_threshold = HALF_WIDTH 
-    steering_scaler = 60
-    max_steer_amount = 60
-    if(math.fabs(cte) > 0):
-        steering = math.copysign((cte / max_steer_threshold * steering_scaler), cte)
-        
-
-        if (math.fabs(steering) > max_steer_amount):
-            steering = math.copysign(max_steer_amount, cte)
-
+    if math.fabs(cte) > 0:
+        steering = math.copysign(cte / HALF_WIDTH * MAX_STEER_SCALER, cte)
+        if math.fabs(steering) > MAX_STEER_AMOUNT:
+            steering = math.copysign(MAX_STEER_AMOUNT, cte)
         steering *= -1
 
     PREVIOUS_DECISIONS[OLDEST_DECISION] = steering
@@ -263,48 +244,38 @@ def process_image(img):
 
     return 0
 
+
 def main():
-    global camera, publish_image
-
     rclpy.init()
-    node = rclpy.create_node('lane_follower')
+    node = rclpy.create_node("lane_follower")
     node.create_subscription(Image, IMAGE_TOPIC, camera_callback, 10)
-    
-    # bridge = CvBridge()
 
-    thread = threading.Thread(target=rclpy.spin, args=(node, ), daemon=True)
+    thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     thread.start()
 
-    auto_steering = node.create_publisher(Int64, "/auto_steering",1)
-    # camera = node.create_publisher(Image, "/custom_camera",1)
+    auto_steering_pub = node.create_publisher(Int64, STEER_TOPIC, 1)
 
-    FREQ = 40
     rate = node.create_rate(FREQ, node.get_clock())
-    
+
     while rclpy.ok() and image is None:
         print("Not receiving image topic")
         rate.sleep()
 
     while rclpy.ok():
-        # Process one image. The return value will be use for `something` later.
-        ret = process_image(image)
-        average_steering = sum(PREVIOUS_DECISIONS) / len(PREVIOUS_DECISIONS)
+        process_image(image)
+
+        average_steering      = sum(PREVIOUS_DECISIONS) / len(PREVIOUS_DECISIONS)
         print("Steering: ", average_steering)
-        wrapped_steering = Int64()
-        wrapped_steering.data = int (average_steering)
 
-        auto_steering.publish(wrapped_steering)
+        wrapped_steering      = Int64()
+        wrapped_steering.data = int(average_steering)
+        auto_steering_pub.publish(wrapped_steering)
 
-        # if publish_image is not None:
-        #     print("publishing")
-        #     camera.publish(bridge.cv2_to_imgmsg(publish_image, 'bgr8'))
-        # else:
-        #     print("why not")
-        
         rate.sleep()
 
     node.destroy_node()
     rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
